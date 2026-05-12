@@ -1,0 +1,14 @@
+{
+  "name": "De Slimme Ontdekkers",
+  "description": "Een interactief educatief platform voor kinderen (Groep 1-8) gebaseerd op het Nederlandse curriculum, met AI-gestuurde verhalen, games en beloningen.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "AI Storytelling",
+    "Educational Games",
+    "AI Image Generation",
+    "Progress Tracking"
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Student profile with progress and rewards.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "displayName": { "type": "string" },
+        "groep": { "type": "integer", "enum": [1, 2, 3, 4, 5, 6, 7, 8] },
+        "coins": { "type": "integer" },
+        "badges": { "type": "array", "items": { "type": "string" } },
+        "lastActive": { "type": "string", "format": "date-time" },
+        "avatarId": { "type": "string" }
+      },
+      "required": ["uid", "displayName", "groep", "coins"]
+    },
+    "Story": {
+      "title": "AI Story",
+      "description": "A story generated for a specific user.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "content": { "type": "string" },
+        "topic": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "videoUrl": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "title", "content", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Store individual student profiles."
+    },
+    "/stories/{storyId}": {
+      "schema": "Story",
+      "description": "Collection of AI generated stories."
+    }
+  }
+}
