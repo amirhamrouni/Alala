@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -10,7 +11,7 @@ from .jobs import JobStore, request_fingerprint
 from .moneyprinter import create_video_job, get_task, wait_for_video
 
 
-app = FastAPI(title="MoneyPrinter Mobile Gateway", version="2.0.0")
+app = FastAPI(title="MoneyPrinter Mobile Gateway", version="2.1.0")
 store = JobStore(settings.state_path)
 queue: asyncio.Queue[str] = asyncio.Queue(maxsize=settings.max_queue_size)
 worker_task: asyncio.Task | None = None
@@ -35,6 +36,20 @@ def _job_request(body: VideoRequest) -> dict[str, Any]:
     }
 
 
+def _resolve_local_video(value: str) -> Path | None:
+    root = settings.moneyprinter_storage_root.expanduser().resolve()
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        candidate = candidate.resolve()
+    except OSError:
+        return None
+    if candidate != root and root not in candidate.parents:
+        return None
+    return candidate if candidate.is_file() else None
+
+
 async def send_telegram_message(chat_id: str, text: str) -> None:
     if not settings.telegram_bot_token:
         return
@@ -51,7 +66,34 @@ async def send_telegram_message(chat_id: str, text: str) -> None:
         response.raise_for_status()
 
 
+async def _send_local_video(chat_id: str, path: Path, job_id: str) -> bool:
+    if not settings.telegram_bot_token:
+        return False
+
+    caption = f"تم إنشاء الفيديو\njob_id: {job_id}"
+    async with httpx.AsyncClient(timeout=240) as client:
+        with path.open("rb") as handle:
+            response = await client.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendVideo",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"video": (path.name, handle, "video/mp4")},
+            )
+        if response.is_success:
+            return True
+
+        with path.open("rb") as handle:
+            response = await client.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendDocument",
+                data={"chat_id": chat_id, "caption": caption},
+                files={"document": (path.name, handle, "video/mp4")},
+            )
+        return response.is_success
+
+
 async def send_telegram_result(chat_id: str, job: dict[str, Any]) -> None:
+    if not settings.telegram_bot_token:
+        return
+
     videos = job.get("videos") or []
     if not videos:
         await send_telegram_message(
@@ -61,6 +103,11 @@ async def send_telegram_result(chat_id: str, job: dict[str, Any]) -> None:
         return
 
     first = str(videos[0])
+    local_path = _resolve_local_video(first)
+    if settings.telegram_send_video and local_path is not None:
+        if await _send_local_video(chat_id, local_path, str(job["job_id"])):
+            return
+
     if settings.telegram_send_video and first.startswith(("http://", "https://")):
         url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendVideo"
         async with httpx.AsyncClient(timeout=180) as client:
@@ -74,6 +121,13 @@ async def send_telegram_result(chat_id: str, job: dict[str, Any]) -> None:
             )
         if response.is_success:
             return
+
+    if local_path is not None:
+        await send_telegram_message(
+            chat_id,
+            f"تم إنشاء الفيديو لكن تعذر رفع الملف إلى Telegram.\njob_id: {job['job_id']}\nالملف: {local_path.name}",
+        )
+        return
 
     links = "\n".join(str(item) for item in videos)
     await send_telegram_message(
