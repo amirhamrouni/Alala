@@ -1,18 +1,34 @@
 name: Deploy MoneyPrinter Gateway
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "moneyprinter-mobile-gateway/**"
-      - ".github/workflows/deploy-moneyprinter-gateway.yml"
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.MONEYPRINTER_SSH_HOST }}
+      SSH_USER: ${{ secrets.MONEYPRINTER_SSH_USER }}
+      SSH_KEY: ${{ secrets.MONEYPRINTER_SSH_KEY }}
+      APP_DIR: ${{ secrets.MONEYPRINTER_APP_DIR }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate deploy secrets
+        shell: bash
+        run: |
+          missing=0
+          for name in SSH_HOST SSH_USER SSH_KEY APP_DIR; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is not configured"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Colab mode does not require SSH deployment. Configure the four MONEYPRINTER_SSH_* / APP_DIR secrets only when a persistent server is available."
+            exit 1
+          fi
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -20,7 +36,8 @@ jobs:
           username: ${{ secrets.MONEYPRINTER_SSH_USER }}
           key: ${{ secrets.MONEYPRINTER_SSH_KEY }}
           script: |
+            set -e
             cd ${{ secrets.MONEYPRINTER_APP_DIR }}
-            git pull
+            git pull --ff-only
             cd moneyprinter-mobile-gateway
             docker compose up -d --build
