@@ -1,0 +1,34 @@
+name: MoneyPrinter Gateway Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "moneyprinter-mobile-gateway/**"
+      - "docs/MoneyPrinterTurbo.ipynb"
+      - ".github/workflows/moneyprinter-gateway-check.yml"
+  pull_request:
+    paths:
+      - "moneyprinter-mobile-gateway/**"
+      - "docs/MoneyPrinterTurbo.ipynb"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install gateway dependencies
+        working-directory: moneyprinter-mobile-gateway
+        run: pip install -r requirements.txt
+      - name: Python syntax
+        run: python -m compileall -q moneyprinter-mobile-gateway/app moneyprinter-mobile-gateway/scripts
+      - name: Import gateway
+        working-directory: moneyprinter-mobile-gateway
+        run: python -c "from app.main import app; assert app.title == 'MoneyPrinter Mobile Gateway'"
+      - name: Validate Colab notebook JSON
+        run: python -c "import json; json.load(open('docs/MoneyPrinterTurbo.ipynb', encoding='utf-8')); print('notebook json ok')"
+      - name: Whitespace check
+        run: git diff --check
