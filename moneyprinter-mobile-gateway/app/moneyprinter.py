@@ -16,7 +16,9 @@ def _normalize_task_id(response_json: dict[str, Any]) -> str:
     data = response_json.get("data", response_json)
     task_id = data.get("task_id") or data.get("id")
     if not task_id:
-        raise RuntimeError(f"MoneyPrinterTurbo did not return a task_id: {response_json}")
+        raise RuntimeError(
+            f"MoneyPrinterTurbo did not return a task_id: {response_json}"
+        )
     return str(task_id)
 
 
@@ -25,22 +27,89 @@ def _extract_video_urls(task_json: dict[str, Any]) -> list[str]:
     urls: list[str] = []
     for key in ("combined_videos", "videos"):
         values = data.get(key) or []
-        if isinstance(values, str):
+        if isinstance(values, (str, dict)):
             values = [values]
-        urls.extend(str(value) for value in values if value)
-    return urls
+        for value in values:
+            if isinstance(value, dict):
+                value = value.get("url") or value.get("path") or value.get("file")
+            if value:
+                urls.append(str(value))
+    return list(dict.fromkeys(urls))
+
+
+def _normalized_task_state(task_json: dict[str, Any]) -> str:
+    data = task_json.get("data", task_json)
+    raw = data.get("state")
+    progress = int(data.get("progress", 0) or 0)
+
+    if raw in (1, "1"):
+        return "completed"
+    if raw in (-1, "-1"):
+        return "failed"
+
+    state = str(raw or "").strip().lower()
+    if state in {"complete", "completed", "success", "succeeded", "finished"}:
+        return "completed"
+    if state in {"failed", "error", "cancelled", "canceled"}:
+        return "failed"
+    if progress >= 100 and _extract_video_urls(task_json):
+        return "completed"
+    return "running"
+
+
+def _error_text(task_json: dict[str, Any]) -> str:
+    data = task_json.get("data", task_json)
+    return str(
+        data.get("error")
+        or data.get("message")
+        or task_json.get("message")
+        or "MoneyPrinterTurbo task failed"
+    )
 
 
 async def create_video_job(topic: str, **overrides: Any) -> dict[str, Any]:
     payload = {
         "video_subject": topic,
-        "video_language": overrides.get("video_language", settings.default_language),
-        "video_aspect": overrides.get("video_aspect", settings.default_aspect),
+        "video_language": overrides.get("video_language") or settings.default_language,
+        "video_aspect": overrides.get("video_aspect") or settings.default_aspect,
+        "video_source": overrides.get("video_source") or settings.default_video_source,
+        "video_concat_mode": (
+            overrides.get("video_concat_mode") or settings.default_video_concat_mode
+        ),
+        "video_clip_duration": int(
+            overrides.get("video_clip_duration")
+            or settings.default_video_clip_duration
+        ),
         "video_count": int(overrides.get("video_count", 1)),
+        "voice_name": overrides.get("voice_name") or settings.default_voice_name,
+        "bgm_type": overrides.get("bgm_type") or settings.default_bgm_type,
+        "bgm_volume": float(
+            overrides.get("bgm_volume")
+            if overrides.get("bgm_volume") is not None
+            else settings.default_bgm_volume
+        ),
         "subtitle_enabled": bool(overrides.get("subtitle_enabled", True)),
-        "bgm_type": overrides.get("bgm_type", "random"),
+        "subtitle_position": (
+            overrides.get("subtitle_position") or settings.default_subtitle_position
+        ),
+        "subtitle_display_mode": overrides.get("subtitle_display_mode") or "sentence",
+        "font_name": overrides.get("font_name") or settings.default_font_name,
+        "font_size": int(overrides.get("font_size") or settings.default_font_size),
+        "stroke_width": float(
+            overrides.get("stroke_width")
+            if overrides.get("stroke_width") is not None
+            else settings.default_stroke_width
+        ),
+        "text_fore_color": overrides.get("text_fore_color") or "#FFFFFF",
+        "stroke_color": overrides.get("stroke_color") or "#000000",
     }
-    payload.update({key: value for key, value in overrides.items() if value is not None})
+
+    passthrough = {
+        key: value
+        for key, value in overrides.items()
+        if value is not None and key not in payload
+    }
+    payload.update(passthrough)
 
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
@@ -50,7 +119,7 @@ async def create_video_job(topic: str, **overrides: Any) -> dict[str, Any]:
         )
         response.raise_for_status()
         body = response.json()
-        return {"task_id": _normalize_task_id(body), "raw": body}
+        return {"task_id": _normalize_task_id(body), "raw": body, "payload": payload}
 
 
 async def get_task(task_id: str) -> dict[str, Any]:
@@ -69,16 +138,30 @@ async def wait_for_video(task_id: str) -> dict[str, Any]:
 
     while asyncio.get_running_loop().time() < deadline:
         last_task = await get_task(task_id)
-        data = last_task.get("data", last_task)
-        state = str(data.get("state", "")).lower()
-        progress = int(data.get("progress", 0) or 0)
+        state = _normalized_task_state(last_task)
         urls = _extract_video_urls(last_task)
 
-        if urls and (progress >= 100 or state in {"complete", "completed", "success", "finished"}):
-            return {"task_id": task_id, "status": "completed", "videos": urls, "raw": last_task}
-        if state in {"failed", "error"}:
-            return {"task_id": task_id, "status": "failed", "videos": urls, "raw": last_task}
+        if state == "completed":
+            return {
+                "task_id": task_id,
+                "status": "completed",
+                "videos": urls,
+                "raw": last_task,
+            }
+        if state == "failed":
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "videos": urls,
+                "error": _error_text(last_task),
+                "raw": last_task,
+            }
 
         await asyncio.sleep(settings.poll_seconds)
 
-    return {"task_id": task_id, "status": "timeout", "videos": _extract_video_urls(last_task), "raw": last_task}
+    return {
+        "task_id": task_id,
+        "status": "timeout",
+        "videos": _extract_video_urls(last_task),
+        "raw": last_task,
+    }
