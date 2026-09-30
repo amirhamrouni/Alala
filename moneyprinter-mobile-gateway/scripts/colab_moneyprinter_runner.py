@@ -48,7 +48,16 @@ def set_scalar(text: str, key: str, value_literal: str) -> str:
 
 
 def secret(name: str) -> str:
-    return os.getenv(name, "").strip()
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        from google.colab import userdata
+
+        value = userdata.get(name)
+        return value.strip() if value else ""
+    except Exception:
+        return ""
 
 
 def normalize_task_id(obj):
@@ -70,15 +79,18 @@ def task_state(obj):
 
 
 def completed_state(state) -> bool:
-    if state == 1 or str(state).lower() in {"1", "success", "completed", "complete", "finished", "ready"}:
-        return True
-    return False
+    return state == 1 or str(state).lower() in {
+        "1",
+        "success",
+        "completed",
+        "complete",
+        "finished",
+        "ready",
+    }
 
 
 def failed_state(state) -> bool:
-    if state == -1 or str(state).lower() in {"-1", "failed", "error"}:
-        return True
-    return False
+    return state == -1 or str(state).lower() in {"-1", "failed", "error"}
 
 
 def main() -> None:
@@ -136,7 +148,10 @@ def main() -> None:
     cfg.write_text(raw, encoding="utf-8")
 
     for port in (api_port, web_port):
-        subprocess.run(["bash", "-lc", f"fuser -k {port}/tcp >/dev/null 2>&1 || true"], check=False)
+        subprocess.run(
+            ["bash", "-lc", f"fuser -k {port}/tcp >/dev/null 2>&1 || true"],
+            check=False,
+        )
     time.sleep(1)
 
     api_log_path = Path("/content/mpt-api.log")
@@ -151,9 +166,15 @@ def main() -> None:
     )
     subprocess.Popen(
         [
-            "uv", "run", "streamlit", "run", "webui/Main.py",
-            f"--server.port={web_port}", "--server.address=0.0.0.0",
-            "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal",
+            "uv",
+            "run",
+            "streamlit",
+            "run",
+            "webui/Main.py",
+            f"--server.port={web_port}",
+            "--server.address=0.0.0.0",
+            "--browser.gatherUsageStats=False",
+            "--client.toolbarMode=minimal",
             "--server.showEmailPrompt=False",
         ],
         cwd=mpt,
@@ -163,7 +184,11 @@ def main() -> None:
 
     api = f"http://127.0.0.1:{api_port}"
     wait_http(api + "/ping", 120, log_path=api_log_path)
-    wait_http(f"http://127.0.0.1:{web_port}/_stcore/health", 120, log_path=web_log_path)
+    wait_http(
+        f"http://127.0.0.1:{web_port}/_stcore/health",
+        120,
+        log_path=web_log_path,
+    )
 
     ngrok_token = secret("NGROK_AUTHTOKEN")
     if ngrok_token:
@@ -174,7 +199,11 @@ def main() -> None:
             ngrok.kill()
         except Exception:
             pass
-        tunnel = ngrok.connect(addr=f"http://127.0.0.1:{web_port}", proto="http", bind_tls=True)
+        tunnel = ngrok.connect(
+            addr=f"http://127.0.0.1:{web_port}",
+            proto="http",
+            bind_tls=True,
+        )
         print("WEBUI=", tunnel.public_url, flush=True)
     else:
         print("WEBUI=LOCAL_ONLY", flush=True)
@@ -185,15 +214,21 @@ def main() -> None:
     print("ARABIC_RTL=PASS", flush=True)
 
     if not tg_token:
-        print("TELEGRAM=MISSING", flush=True)
-        print("READY_WITHOUT_TELEGRAM", flush=True)
-        while True:
-            time.sleep(60)
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from Colab Secrets")
 
     tg = f"https://api.telegram.org/bot{tg_token}"
     session = requests.Session()
-    session.post(tg + "/deleteWebhook", json={"drop_pending_updates": False}, timeout=30).raise_for_status()
-    me = session.get(tg + "/getMe", timeout=30).json()
+
+    webhook_resp = session.post(
+        tg + "/deleteWebhook",
+        json={"drop_pending_updates": False},
+        timeout=30,
+    )
+    webhook_resp.raise_for_status()
+
+    me_resp = session.get(tg + "/getMe", timeout=30)
+    me_resp.raise_for_status()
+    me = me_resp.json()
     if not me.get("ok"):
         raise RuntimeError("Telegram token rejected")
     username = me["result"]["username"]
@@ -201,8 +236,15 @@ def main() -> None:
     print("READY", flush=True)
 
     def send(chat, text):
-        r = session.post(tg + "/sendMessage", json={"chat_id": chat, "text": text}, timeout=30)
+        r = session.post(
+            tg + "/sendMessage",
+            json={"chat_id": chat, "text": text},
+            timeout=30,
+        )
         r.raise_for_status()
+        body = r.json()
+        if not body.get("ok"):
+            raise RuntimeError(f"Telegram sendMessage failed: {body}")
         return r
 
     def send_video(chat, path: Path):
@@ -224,6 +266,9 @@ def main() -> None:
                 timeout=240,
             )
             r.raise_for_status()
+            body = r.json()
+            if not body.get("ok"):
+                raise RuntimeError(f"Telegram sendDocument failed: {body}")
 
     def make_video(chat, topic):
         send(chat, "بدأت إنشاء الفيديو عن: " + topic + "\nسأرسله هنا عند اكتماله.")
@@ -252,12 +297,16 @@ def main() -> None:
 
         deadline = time.time() + 45 * 60
         while time.time() < deadline:
-            info = session.get(api + "/api/v1/tasks/" + tid, timeout=30).json()
+            info_resp = session.get(api + "/api/v1/tasks/" + tid, timeout=30)
+            info_resp.raise_for_status()
+            info = info_resp.json()
             state, data = task_state(info)
             if completed_state(state):
                 break
             if failed_state(state):
-                raise RuntimeError(str(data.get("error") or data.get("message") or info)[:700])
+                raise RuntimeError(
+                    str(data.get("error") or data.get("message") or info)[:700]
+                )
             time.sleep(10)
         else:
             raise RuntimeError("Video generation timed out")
@@ -273,11 +322,30 @@ def main() -> None:
     offset = 0
     while True:
         try:
-            result = session.get(
+            poll = session.get(
                 tg + "/getUpdates",
-                params={"offset": offset, "timeout": 25},
+                params={
+                    "offset": offset,
+                    "timeout": 25,
+                    "allowed_updates": json.dumps(["message"]),
+                },
                 timeout=35,
-            ).json()
+            )
+            if poll.status_code == 409:
+                try:
+                    body = poll.json()
+                    description = body.get("description", "another getUpdates client is active")
+                except Exception:
+                    description = "another getUpdates client is active"
+                print("TELEGRAM_CONFLICT=", description, flush=True)
+                print("Stop the other Colab/bot process using this same Telegram token.", flush=True)
+                time.sleep(10)
+                continue
+            poll.raise_for_status()
+            result = poll.json()
+            if not result.get("ok"):
+                raise RuntimeError(f"Telegram getUpdates failed: {result}")
+
             for update in result.get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message") or {}
@@ -285,8 +353,12 @@ def main() -> None:
                 text = (msg.get("text") or "").strip()
                 if not chat or not text:
                     continue
+                print("TELEGRAM_RX=PASS", flush=True)
                 if text.startswith("/start"):
-                    send(chat, "أرسل موضوع الفيديو فقط، مثال: فوائد الذكاء الاصطناعي في الدراسة")
+                    send(
+                        chat,
+                        "أرسل موضوع الفيديو فقط، مثال: فوائد الذكاء الاصطناعي في الدراسة",
+                    )
                     continue
                 topic = re.sub(
                     r"^(اعملي|اعمل|اصنع|أنشئ)\s+(لي\s+)?فيديو\s+(عن\s+)?",
@@ -300,7 +372,7 @@ def main() -> None:
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            print("poll error:", type(exc).__name__, str(exc)[:250], flush=True)
+            print("poll error:", type(exc).__name__, str(exc)[:500], flush=True)
             time.sleep(5)
 
 
