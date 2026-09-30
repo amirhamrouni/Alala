@@ -15,6 +15,9 @@ class Settings:
         "http://127.0.0.1:8090",
     ).rstrip("/")
     moneyprinter_api_token = os.getenv("MONEYPRINTER_API_TOKEN", "")
+    moneyprinter_storage_root = Path(
+        os.getenv("MONEYPRINTER_STORAGE_ROOT", "/content/MoneyPrinterTurbo")
+    )
     public_base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
     telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
