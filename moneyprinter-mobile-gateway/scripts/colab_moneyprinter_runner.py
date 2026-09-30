@@ -10,33 +10,41 @@ import time
 from pathlib import Path
 
 
-def sh(cmd, *, cwd=None, check=True):
-    print("$", " ".join(map(str, cmd)), flush=True)
-    return subprocess.run(cmd, cwd=cwd, check=check)
+def secret(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        from google.colab import userdata
+        value = userdata.get(name)
+        return value.strip() if value else ""
+    except Exception:
+        return ""
 
 
-def pip_install(*packages: str) -> None:
-    sh([sys.executable, "-m", "pip", "install", "-q", *packages])
-
-
-def http_ok(url: str, timeout: int = 3) -> bool:
+def healthy(url: str) -> bool:
     try:
         import requests
-
-        return requests.get(url, timeout=timeout).status_code == 200
+        return requests.get(url, timeout=3).status_code == 200
     except Exception:
         return False
 
 
-def wait_http(url: str, seconds: int, *, log_path: Path | None = None) -> None:
-    deadline = time.time() + seconds
-    while time.time() < deadline:
-        if http_ok(url):
-            return
-        time.sleep(2)
-    if log_path and log_path.exists():
-        print(log_path.read_text(encoding="utf-8", errors="replace")[-4000:], flush=True)
-    raise RuntimeError(f"service did not become healthy: {url}")
+def task_id_from(obj):
+    if isinstance(obj, dict):
+        for key in ("task_id", "taskId", "id"):
+            if key in obj and isinstance(obj[key], (str, int)):
+                return str(obj[key])
+        for value in obj.values():
+            found = task_id_from(value)
+            if found:
+                return found
+    return None
+
+
+def state_from(obj):
+    data = obj.get("data", obj) if isinstance(obj, dict) else {}
+    return data.get("state"), data
 
 
 def set_scalar(text: str, key: str, value_literal: str) -> str:
@@ -47,228 +55,123 @@ def set_scalar(text: str, key: str, value_literal: str) -> str:
     return text.rstrip() + "\n" + replacement + "\n"
 
 
-def secret(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if value:
-        return value
-    try:
-        from google.colab import userdata
-
-        value = userdata.get(name)
-        return value.strip() if value else ""
-    except Exception:
-        return ""
-
-
-def normalize_task_id(obj):
-    if isinstance(obj, dict):
-        for key in ("task_id", "taskId", "id"):
-            value = obj.get(key)
-            if isinstance(value, (str, int)) and str(value):
-                return str(value)
-        for value in obj.values():
-            found = normalize_task_id(value)
-            if found:
-                return found
-    return None
-
-
-def task_state(obj):
-    data = obj.get("data", obj) if isinstance(obj, dict) else {}
-    return data.get("state"), data
-
-
-def completed_state(state) -> bool:
-    return state == 1 or str(state).lower() in {
-        "1",
-        "success",
-        "completed",
-        "complete",
-        "finished",
-        "ready",
-    }
-
-
-def failed_state(state) -> bool:
-    return state == -1 or str(state).lower() in {"-1", "failed", "error"}
-
-
 def main() -> None:
-    pip_install("uv", "pyngrok", "requests")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "uv", "pyngrok", "requests"],
+        check=True,
+    )
+
     import requests
+    from pyngrok import ngrok
 
-    mpt = Path("/content/MoneyPrinterTurbo")
+    repo = Path("/content/MoneyPrinterTurbo")
     upstream = "https://github.com/harry0703/MoneyPrinterTurbo.git"
-    alala = Path("/content/Alala")
-    patch_script = alala / "moneyprinter-mobile-gateway/scripts/patch_moneyprinter_arabic.py"
+    api = "http://127.0.0.1:8090"
 
-    if (mpt / ".git").is_dir():
-        sh(["git", "-C", str(mpt), "pull", "--ff-only"])
+    if not (repo / ".git").is_dir():
+        if repo.exists():
+            subprocess.run(["rm", "-rf", str(repo)], check=True)
+        subprocess.run(["git", "clone", "--depth", "1", upstream, str(repo)], check=True)
     else:
-        if mpt.exists():
-            sh(["rm", "-rf", str(mpt)])
-        sh(["git", "clone", "--depth", "1", upstream, str(mpt)])
+        subprocess.run(["git", "-C", str(repo), "pull", "--ff-only"], check=True)
 
-    sh(["uv", "python", "install", "3.11"])
-    sh(["uv", "sync", "--frozen", "--python", "3.11"], cwd=mpt)
-    sh(["apt-get", "update", "-qq"])
-    sh(["apt-get", "install", "-y", "-qq", "fonts-dejavu"])
+    subprocess.run(["uv", "python", "install", "3.11"], check=True)
+    subprocess.run(["uv", "sync", "--frozen", "--python", "3.11"], cwd=repo, check=True)
 
-    if not patch_script.is_file():
-        raise RuntimeError(f"Arabic patch script missing: {patch_script}")
-    sh([sys.executable, str(patch_script), "--repo", str(mpt)])
-
-    api_port = 8090
-    web_port = 8501
-    cfg = mpt / "config.toml"
+    cfg = repo / "config.toml"
     if not cfg.exists():
-        cfg.write_text((mpt / "config.example.toml").read_text(encoding="utf-8"), encoding="utf-8")
+        cfg.write_text(
+            (repo / "config.example.toml").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
     raw = cfg.read_text(encoding="utf-8")
-    raw = set_scalar(raw, "listen_port", str(api_port))
-    raw = set_scalar(raw, "video_source", '"pexels"')
+    raw = set_scalar(raw, "listen_port", "8090")
 
-    pexels = secret("PEXELS_API_KEY") or secret("MPT_PEXELS_API_KEY")
-    if pexels:
-        raw = set_scalar(raw, "pexels_api_keys", json.dumps([pexels]))
+    pexels_key = secret("PEXELS_API_KEY") or secret("MPT_PEXELS_API_KEY")
+    if pexels_key:
+        raw = set_scalar(raw, "pexels_api_keys", json.dumps([pexels_key]))
 
-    openrouter = secret("OPENROUTER_API_KEY")
-    gemini = secret("GEMINI_API_KEY") or secret("GOOGLE_API_KEY")
-    if openrouter:
-        raw = set_scalar(raw, "llm_provider", '"openrouter"')
-        raw = set_scalar(raw, "openrouter_api_key", json.dumps(openrouter))
-        model = secret("OPENROUTER_MODEL") or "minimax/minimax-m3:free"
-        raw = set_scalar(raw, "openrouter_model_name", json.dumps(model))
-    elif gemini:
+    gemini_key = secret("GEMINI_API_KEY") or secret("GOOGLE_API_KEY")
+    if gemini_key:
         raw = set_scalar(raw, "llm_provider", '"gemini"')
-        raw = set_scalar(raw, "gemini_api_key", json.dumps(gemini))
-        model = secret("GEMINI_MODEL")
-        if model:
-            raw = set_scalar(raw, "gemini_model_name", json.dumps(model))
+        raw = set_scalar(raw, "gemini_api_key", json.dumps(gemini_key))
+        gemini_model = secret("GEMINI_MODEL")
+        if gemini_model:
+            raw = set_scalar(raw, "gemini_model_name", json.dumps(gemini_model))
 
     cfg.write_text(raw, encoding="utf-8")
 
-    for port in (api_port, web_port):
-        subprocess.run(
-            ["bash", "-lc", f"fuser -k {port}/tcp >/dev/null 2>&1 || true"],
-            check=False,
+    if not healthy("http://127.0.0.1:8501/_stcore/health"):
+        web_log = open("/content/mpt-webui.log", "a", encoding="utf-8")
+        subprocess.Popen(
+            [
+                "uv", "run", "streamlit", "run", "webui/Main.py",
+                "--server.port=8501", "--server.address=0.0.0.0",
+                "--browser.gatherUsageStats=False",
+            ],
+            cwd=repo,
+            stdout=web_log,
+            stderr=subprocess.STDOUT,
         )
-    time.sleep(1)
+        for _ in range(60):
+            if healthy("http://127.0.0.1:8501/_stcore/health"):
+                break
+            time.sleep(2)
 
-    api_log_path = Path("/content/mpt-api.log")
-    web_log_path = Path("/content/mpt-webui.log")
-    api_log = api_log_path.open("w", encoding="utf-8")
-    web_log = web_log_path.open("w", encoding="utf-8")
-    subprocess.Popen(
-        ["uv", "run", "python", "main.py"],
-        cwd=mpt,
-        stdout=api_log,
-        stderr=subprocess.STDOUT,
-    )
-    subprocess.Popen(
-        [
-            "uv",
-            "run",
-            "streamlit",
-            "run",
-            "webui/Main.py",
-            f"--server.port={web_port}",
-            "--server.address=0.0.0.0",
-            "--browser.gatherUsageStats=False",
-            "--client.toolbarMode=minimal",
-            "--server.showEmailPrompt=False",
-        ],
-        cwd=mpt,
-        stdout=web_log,
-        stderr=subprocess.STDOUT,
-    )
+    if not healthy(api + "/ping"):
+        api_log = open("/content/mpt-api.log", "a", encoding="utf-8")
+        subprocess.Popen(
+            ["uv", "run", "python", "main.py"],
+            cwd=repo,
+            stdout=api_log,
+            stderr=subprocess.STDOUT,
+        )
+        for _ in range(60):
+            if healthy(api + "/ping"):
+                break
+            time.sleep(2)
 
-    api = f"http://127.0.0.1:{api_port}"
-    wait_http(api + "/ping", 120, log_path=api_log_path)
-    wait_http(
-        f"http://127.0.0.1:{web_port}/_stcore/health",
-        120,
-        log_path=web_log_path,
-    )
+    if not healthy(api + "/ping"):
+        raise RuntimeError("MoneyPrinter API did not start on port 8090")
 
     ngrok_token = secret("NGROK_AUTHTOKEN")
     if ngrok_token:
-        from pyngrok import ngrok
-
         ngrok.set_auth_token(ngrok_token)
         try:
             ngrok.kill()
         except Exception:
             pass
-        tunnel = ngrok.connect(
-            addr=f"http://127.0.0.1:{web_port}",
-            proto="http",
-            bind_tls=True,
-        )
-        print("WEBUI=", tunnel.public_url, flush=True)
-    else:
-        print("WEBUI=LOCAL_ONLY", flush=True)
+        tunnel = ngrok.connect(addr="http://127.0.0.1:8501", proto="http", bind_tls=True)
+        print("WebUI:", tunnel.public_url, flush=True)
 
     tg_token = secret("TELEGRAM_BOT_TOKEN")
-    print("MPT_API=PASS", flush=True)
-    print("WEBUI=PASS", flush=True)
-    print("ARABIC_RTL=PASS", flush=True)
-
     if not tg_token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing from Colab Secrets")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN missing from Colab Secrets")
 
     tg = f"https://api.telegram.org/bot{tg_token}"
     session = requests.Session()
 
-    webhook_resp = session.post(
+    session.post(
         tg + "/deleteWebhook",
         json={"drop_pending_updates": False},
-        timeout=30,
-    )
-    webhook_resp.raise_for_status()
+        timeout=20,
+    ).raise_for_status()
 
-    me_resp = session.get(tg + "/getMe", timeout=30)
-    me_resp.raise_for_status()
-    me = me_resp.json()
+    me = session.get(tg + "/getMe", timeout=20).json()
     if not me.get("ok"):
         raise RuntimeError("Telegram token rejected")
-    username = me["result"]["username"]
-    print(f"TELEGRAM=PASS @{username}", flush=True)
+
+    print("Telegram bot ready: @" + me["result"]["username"], flush=True)
+    print("SUBTITLES=OFF", flush=True)
     print("READY", flush=True)
 
     def send(chat, text):
-        r = session.post(
+        return session.post(
             tg + "/sendMessage",
             json={"chat_id": chat, "text": text},
             timeout=30,
         )
-        r.raise_for_status()
-        body = r.json()
-        if not body.get("ok"):
-            raise RuntimeError(f"Telegram sendMessage failed: {body}")
-        return r
-
-    def send_video(chat, path: Path):
-        with path.open("rb") as fh:
-            r = session.post(
-                tg + "/sendVideo",
-                data={"chat_id": chat, "caption": "تم إنشاء الفيديو"},
-                files={"video": (path.name, fh, "video/mp4")},
-                timeout=240,
-            )
-        body = r.json()
-        if body.get("ok"):
-            return
-        with path.open("rb") as fh:
-            r = session.post(
-                tg + "/sendDocument",
-                data={"chat_id": chat, "caption": "تم إنشاء الفيديو"},
-                files={"document": (path.name, fh, "video/mp4")},
-                timeout=240,
-            )
-            r.raise_for_status()
-            body = r.json()
-            if not body.get("ok"):
-                raise RuntimeError(f"Telegram sendDocument failed: {body}")
 
     def make_video(chat, topic):
         send(chat, "بدأت إنشاء الفيديو عن: " + topic + "\nسأرسله هنا عند اكتماله.")
@@ -286,93 +189,84 @@ def main() -> None:
             "voice_rate": 1.0,
             "bgm_type": "random",
             "bgm_volume": 0.2,
-            "subtitle_enabled": True,
-            "font_name": "DejaVuSans.ttf",
+            "subtitle_enabled": False,
         }
-        response = session.post(api + "/api/v1/videos", json=payload, timeout=90)
-        response.raise_for_status()
-        tid = normalize_task_id(response.json())
-        if not tid:
-            raise RuntimeError("MoneyPrinter did not return task_id")
 
-        deadline = time.time() + 45 * 60
-        while time.time() < deadline:
-            info_resp = session.get(api + "/api/v1/tasks/" + tid, timeout=30)
-            info_resp.raise_for_status()
-            info = info_resp.json()
-            state, data = task_state(info)
-            if completed_state(state):
+        response = session.post(api + "/api/v1/videos", json=payload, timeout=60)
+        response.raise_for_status()
+        tid = task_id_from(response.json())
+        if not tid:
+            raise RuntimeError("No task id: " + response.text[:300])
+
+        for _ in range(180):
+            info = session.get(api + "/api/v1/tasks/" + tid, timeout=30).json()
+            state, data = state_from(info)
+            if state == 1:
                 break
-            if failed_state(state):
+            if state == -1:
                 raise RuntimeError(
-                    str(data.get("error") or data.get("message") or info)[:700]
+                    str(data.get("error") or data.get("message") or info)[:500]
                 )
             time.sleep(10)
         else:
             raise RuntimeError("Video generation timed out")
 
-        task_dir = mpt / "storage" / "tasks" / tid
-        files = sorted(task_dir.glob("final-*.mp4"), key=lambda p: p.stat().st_mtime)
+        files = sorted((repo / "storage" / "tasks" / tid).glob("final-*.mp4"))
         if not files:
-            files = sorted(task_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+            files = sorted((repo / "storage" / "tasks" / tid).glob("*.mp4"))
         if not files:
-            raise RuntimeError(f"completed but MP4 not found for task {tid}")
-        send_video(chat, files[-1])
+            raise RuntimeError("Completed but video file was not found")
+
+        with files[-1].open("rb") as file_handle:
+            resp = session.post(
+                tg + "/sendVideo",
+                data={"chat_id": chat, "caption": "تم إنشاء الفيديو"},
+                files={"video": (files[-1].name, file_handle, "video/mp4")},
+                timeout=180,
+            )
+
+        if not resp.json().get("ok"):
+            with files[-1].open("rb") as file_handle:
+                session.post(
+                    tg + "/sendDocument",
+                    data={"chat_id": chat, "caption": "تم إنشاء الفيديو"},
+                    files={"document": (files[-1].name, file_handle, "video/mp4")},
+                    timeout=180,
+                ).raise_for_status()
 
     offset = 0
+    print("Send /start to the bot.", flush=True)
+
     while True:
         try:
-            poll = session.get(
+            updates = session.get(
                 tg + "/getUpdates",
-                params={
-                    "offset": offset,
-                    "timeout": 25,
-                    "allowed_updates": json.dumps(["message"]),
-                },
+                params={"offset": offset, "timeout": 25},
                 timeout=35,
-            )
-            if poll.status_code == 409:
-                try:
-                    body = poll.json()
-                    description = body.get("description", "another getUpdates client is active")
-                except Exception:
-                    description = "another getUpdates client is active"
-                print("TELEGRAM_CONFLICT=", description, flush=True)
-                print("Stop the other Colab/bot process using this same Telegram token.", flush=True)
-                time.sleep(10)
-                continue
-            poll.raise_for_status()
-            result = poll.json()
-            if not result.get("ok"):
-                raise RuntimeError(f"Telegram getUpdates failed: {result}")
+            ).json()
 
-            for update in result.get("result", []):
+            for update in updates.get("result", []):
                 offset = update["update_id"] + 1
                 msg = update.get("message") or {}
                 chat = (msg.get("chat") or {}).get("id")
                 text = (msg.get("text") or "").strip()
                 if not chat or not text:
                     continue
-                print("TELEGRAM_RX=PASS", flush=True)
+
                 if text.startswith("/start"):
-                    send(
-                        chat,
-                        "أرسل موضوع الفيديو فقط، مثال: فوائد الذكاء الاصطناعي في الدراسة",
-                    )
-                    continue
-                topic = re.sub(
-                    r"^(اعملي|اعمل|اصنع|أنشئ)\s+(لي\s+)?فيديو\s+(عن\s+)?",
-                    "",
-                    text,
-                ).strip() or text
-                try:
-                    make_video(chat, topic)
-                except Exception as exc:
-                    send(chat, "تعذر إنشاء الفيديو: " + str(exc)[:700])
-        except KeyboardInterrupt:
-            raise
+                    send(chat, "أرسل موضوع الفيديو فقط، مثال: فوائد الذكاء الاصطناعي في الدراسة")
+                else:
+                    topic = re.sub(
+                        r"^(اعملي|اعمل|اصنع|أنشئ)\s+(لي\s+)?فيديو\s+(عن\s+)?",
+                        "",
+                        text,
+                    ).strip() or text
+                    try:
+                        make_video(chat, topic)
+                    except Exception as exc:
+                        send(chat, "تعذر إنشاء الفيديو: " + str(exc)[:700])
         except Exception as exc:
-            print("poll error:", type(exc).__name__, str(exc)[:500], flush=True)
+            print("poll error:", type(exc).__name__, str(exc)[:200], flush=True)
             time.sleep(5)
 
 
